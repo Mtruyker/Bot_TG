@@ -1,0 +1,1 @@
+worker: python yandex_music_telegram_bot.py

@@ -1,18 +1,25 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
 from dataclasses import dataclass
 from html import escape
 from threading import Lock
-from urllib.parse import urlparse
+from typing import Any
+from urllib.parse import urlencode, urlparse
+from urllib.request import Request, urlopen
 
 from telegram import Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
-from yandex_music import Client
+
+try:
+    from yandex_music import Client
+except ImportError:
+    Client = None
 
 
 logging.basicConfig(
@@ -22,6 +29,11 @@ logging.basicConfig(
 
 LOGGER = logging.getLogger(__name__)
 URL_RE = re.compile(r"(?:https?://)?[^\s<>]+", re.IGNORECASE)
+YANDEX_TRACK_ENDPOINT = "https://music.yandex.ru/handlers/track.jsx"
+YANDEX_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36"
+)
 
 
 @dataclass(frozen=True)
@@ -44,15 +56,47 @@ class TrackInfo:
 class YandexMusicService:
     def __init__(self, token: str | None = None) -> None:
         self._token = token
-        self._client: Client | None = None
+        self._client: Any | None = None
         self._lock = Lock()
 
-    def _get_client(self) -> Client:
+    def _fetch_from_public_endpoint(self, link: TrackLink) -> TrackInfo:
+        url = f"{YANDEX_TRACK_ENDPOINT}?{urlencode({'track': link.yandex_music_id})}"
+        request = Request(
+            url,
+            headers={
+                "Accept": "application/json",
+                "User-Agent": YANDEX_USER_AGENT,
+            },
+        )
+
+        with urlopen(request, timeout=15) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+
+        track = payload.get("track")
+        if not isinstance(track, dict):
+            raise LookupError("Yandex Music response does not contain track data")
+
+        title = track.get("title") or "Без названия"
+        artists = ", ".join(
+            artist.get("name", "") for artist in track.get("artists", []) if isinstance(artist, dict) and artist.get("name")
+        )
+        duration_ms = int(track.get("durationMs") or 0)
+
+        return TrackInfo(
+            title=title,
+            artists=artists or "Неизвестный артист",
+            duration_ms=duration_ms,
+        )
+
+    def _get_client(self) -> Any:
+        if Client is None:
+            raise RuntimeError("yandex-music package is not installed")
+
         if self._client is None:
             self._client = (Client(self._token) if self._token else Client()).init()
         return self._client
 
-    def fetch_track_info(self, link: TrackLink) -> TrackInfo:
+    def _fetch_from_library(self, link: TrackLink) -> TrackInfo:
         with self._lock:
             tracks = self._get_client().tracks([link.yandex_music_id])
 
@@ -66,6 +110,18 @@ class YandexMusicService:
             artists=artists,
             duration_ms=track.duration_ms or 0,
         )
+
+    def fetch_track_info(self, link: TrackLink) -> TrackInfo:
+        try:
+            return self._fetch_from_public_endpoint(link)
+        except Exception:
+            LOGGER.warning("Yandex Music public endpoint failed", exc_info=True)
+
+        try:
+            return self._fetch_from_library(link)
+        except Exception as library_error:
+            LOGGER.warning("Yandex Music library fallback failed", exc_info=True)
+            raise LookupError("Failed to fetch track from Yandex Music") from library_error
 
 
 def extract_track_link(text: str) -> TrackLink | None:
